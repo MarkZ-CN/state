@@ -51,16 +51,50 @@ def evaluate_intrinsic(model, cfg, device=None, logger=print, adata=None):
 
 def evaluate_de(model, cfg, device=None, logger=print):
     """
-    Standalone evaluation of differential expression (DE).
-
-    Returns the anndata annotated with X_emb
+    Evaluate differential expression (DE) prediction performance.
+    
+    This function compares the model's predicted DE genes against ground truth DE genes
+    identified using statistical tests. It uses the CELL-EVAL framework approach to:
+    1. Identify ground truth DE genes via statistical ranking (e.g., t-test, Wilcoxon)
+    2. Get model's predicted DE genes based on expression changes
+    3. Compute overlap between predicted and ground truth gene sets
+    
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained model with _predict_exp_for_adata method
+    cfg : dict
+        Configuration dictionary containing:
+        - validations.diff_exp.dataset: Path to validation dataset
+        - validations.diff_exp.obs_pert_col: Column name for perturbations
+        - validations.diff_exp.obs_filter_label: Control/reference perturbation label
+        - validations.diff_exp.top_k_rank: Number of top DE genes to identify (e.g., 50)
+        - validations.diff_exp.method: Statistical test method ('t-test', 'wilcoxon', etc.)
+        - validations.diff_exp.dataset_name: Name of the dataset
+    device : torch.device, optional
+        Device for computation
+    logger : callable, optional
+        Logging function (default: print)
+    
+    Returns
+    -------
+    anndata.AnnData
+        Annotated data with model embeddings in X_emb
+        
+    Notes
+    -----
+    The top_k_rank parameter (default: 50) determines how many top DE genes to compare.
+    This is a key parameter in CELL-EVAL's differential expression evaluation.
     """
 
-    # Get ground truth DE genes
-    de_val_adata = sc.read_h5ad(cfg["validations"]["diff_exp"]["dataset"])
-    sc.pp.log1p(de_val_adata)
+    # Identify ground truth DE genes using statistical tests
+    de_validation_adata = sc.read_h5ad(cfg["validations"]["diff_exp"]["dataset"])
+    sc.pp.log1p(de_validation_adata)
+    
+    # Use Scanpy's rank_genes_groups to perform statistical DE analysis
+    # This identifies genes most differentially expressed in each perturbation vs. control
     sc.tl.rank_genes_groups(
-        de_val_adata,
+        de_validation_adata,
         groupby=cfg["validations"]["diff_exp"]["obs_pert_col"],
         reference=cfg["validations"]["diff_exp"]["obs_filter_label"],
         rankby_abs=True,
@@ -68,21 +102,27 @@ def evaluate_de(model, cfg, device=None, logger=print):
         method=cfg["validations"]["diff_exp"]["method"],
         use_raw=False,
     )
-    true_top_genes = pd.DataFrame(de_val_adata.uns["rank_genes_groups"]["names"]).T
-    del de_val_adata
+    ground_truth_top_genes = pd.DataFrame(de_validation_adata.uns["rank_genes_groups"]["names"]).T
+    del de_validation_adata
 
-    # now for the model
-    tmp_adata = sc.read_h5ad(cfg["validations"]["diff_exp"]["dataset"])
-    pred_exp = model._predict_exp_for_adata(
-        tmp_adata, cfg["validations"]["diff_exp"]["dataset_name"], cfg["validations"]["diff_exp"]["obs_pert_col"]
+    # Get model's predicted DE genes
+    evaluation_adata = sc.read_h5ad(cfg["validations"]["diff_exp"]["dataset"])
+    predicted_de_genes = model._predict_exp_for_adata(
+        evaluation_adata, 
+        cfg["validations"]["diff_exp"]["dataset_name"], 
+        cfg["validations"]["diff_exp"]["obs_pert_col"]
     )
     torch.cuda.synchronize()
-    de_metrics = compute_gene_overlap_cross_pert(
-        pred_exp, true_top_genes, k=cfg["validations"]["diff_exp"]["top_k_rank"]
+    
+    # Compute overlap between predicted and ground truth DE genes
+    de_overlap_metrics = compute_gene_overlap_cross_pert(
+        predicted_de_genes, 
+        ground_truth_top_genes, 
+        top_k_genes_count=cfg["validations"]["diff_exp"]["top_k_rank"]
     )
-    mean_overlap = float(np.array(list(de_metrics.values())).mean())
-    logger(f"DE gene overlap mean: {mean_overlap:.4f}")
-    return tmp_adata
+    mean_overlap_score = float(np.array(list(de_overlap_metrics.values())).mean())
+    logger(f"DE gene overlap mean: {mean_overlap_score:.4f}")
+    return evaluation_adata
 
 
 class MLPClassifier(nn.Module):

@@ -165,41 +165,66 @@ def run_emb_eval(args):
     probs_df = pd.DataFrame(logprob_batches)
     probs_df[args.pert_col] = adata.obs[args.pert_col].values
 
-    # Get top-k genes for each perturbation
-    k = cfg.validations.diff_exp.top_k_rank
+    # Identify top-k differentially expressed genes for each perturbation
+    # Parameter: top_k_genes_count specifies how many top DE genes to identify
+    top_k_genes_count = cfg.validations.diff_exp.top_k_rank
+    
+    # Group predictions by perturbation and compute mean expression probabilities
     probs_df = probs_df.groupby(args.pert_col).mean()
-    ctrl = probs_df.loc[args.control_pert].values
-    pert_effects = np.abs(probs_df - ctrl)
-    top_k_indices = np.argsort(pert_effects.values, axis=1)[:, -k:][:, ::-1]
-    top_k_genes = np.array(adata.var.index)[top_k_indices]
-    pred_de_genes = pd.DataFrame(top_k_genes)
-    pred_de_genes.index = pert_effects.index.values
+    
+    # Get control/baseline expression to compute perturbation effects
+    control_expression = probs_df.loc[args.control_pert].values
+    
+    # Calculate perturbation effects as absolute difference from control
+    # This identifies genes whose expression is most affected by each perturbation
+    perturbation_effects = np.abs(probs_df - control_expression)
+    
+    # For each perturbation, get indices of top-k genes with largest effects
+    # np.argsort sorts in ascending order, so we take last k elements and reverse
+    top_k_gene_indices = np.argsort(perturbation_effects.values, axis=1)[:, -top_k_genes_count:][:, ::-1]
+    
+    # Map indices back to gene names
+    top_k_gene_names = np.array(adata.var.index)[top_k_gene_indices]
+    
+    # Create DataFrame of predicted DE genes (rows=perturbations, columns=top-k gene names)
+    predicted_de_genes = pd.DataFrame(top_k_gene_names)
+    predicted_de_genes.index = perturbation_effects.index.values
 
-    print(f"Predicted DEGs shape: {pred_de_genes.shape}")
+    print(f"Predicted DEGs shape: {predicted_de_genes.shape}")
 
-    # Compute ground truth DEGs for ALL genes (for ROC/PR curves)
+    # Compute ground truth DE genes using statistical tests (CELL-EVAL approach)
     print("Computing ground truth DEGs for all genes...")
     adata_copy = adata.copy()  # Don't modify original adata
     sc.pp.log1p(adata_copy)
 
-    # First compute for top k genes (for overlap metric)
+    # Use Scanpy's rank_genes_groups to identify top-k statistically significant DE genes
+    # Parameters:
+    #   - groupby: Column defining perturbation groups
+    #   - reference: Control/baseline perturbation for comparison
+    #   - rankby_abs: Rank by absolute fold change (not directional)
+    #   - n_genes: Number of top genes to retrieve (top_k_genes_count)
+    #   - method: Statistical test method (e.g., 't-test', 'wilcoxon')
     sc.tl.rank_genes_groups(
         adata_copy,
         groupby=args.pert_col,
         reference=args.control_pert,
         rankby_abs=True,
-        n_genes=k,
+        n_genes=top_k_genes_count,
         method=cfg.validations.diff_exp.method,
         use_raw=False,
     )
-    true_de_genes = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
-    true_de_genes = true_de_genes.T
+    
+    # Extract ground truth DE gene names from Scanpy results
+    ground_truth_de_genes = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
+    ground_truth_de_genes = ground_truth_de_genes.T
 
-    print(f"Ground truth DEGs shape: {true_de_genes.shape}")
+    print(f"Ground truth DEGs shape: {ground_truth_de_genes.shape}")
 
-    # Compute overlap metrics
+    # Compute overlap metrics between predicted and ground truth DE genes
     print("Computing gene overlap metrics...")
-    de_metrics = compute_gene_overlap_cross_pert(pred_de_genes, true_de_genes, control_pert=args.control_pert, k=k)
+    de_metrics = compute_gene_overlap_cross_pert(
+        predicted_de_genes, ground_truth_de_genes, control_pert=args.control_pert, top_k_genes_count=top_k_genes_count
+    )
 
     # Now compute for ALL genes (for ROC/PR curves)
     print("Computing statistical tests for all genes...")
@@ -230,52 +255,53 @@ def run_emb_eval(args):
     # Get gene order from original adata
     gene_order = adata.var.index.tolist()
 
-    for pert in pert_effects.index:
-        if pert == args.control_pert or pert not in names_df.columns:
+    for perturbation in perturbation_effects.index:
+        if perturbation == args.control_pert or perturbation not in names_df.columns:
             continue
 
         # Get predicted scores (in original gene order)
-        pred_scores = pert_effects.loc[pert].values
+        predicted_effect_scores = perturbation_effects.loc[perturbation].values
 
         # Get ground truth results for this perturbation (proper alignment)
-        pert_col_idx = names_df.columns.get_loc(pert)
-        pert_names = names_df.iloc[:, pert_col_idx].values  # Gene names ordered by significance
-        pert_pvals = pvals_df.iloc[:, pert_col_idx].values  # P-values in same order
+        perturbation_col_idx = names_df.columns.get_loc(perturbation)
+        perturbation_gene_names = names_df.iloc[:, perturbation_col_idx].values  # Gene names ordered by significance
+        perturbation_pvalues = pvals_df.iloc[:, perturbation_col_idx].values  # P-values in same order
 
         # Create a mapping from gene name to p-value
-        gene_to_pval = dict(zip(pert_names, pert_pvals))
+        gene_to_pvalue_map = dict(zip(perturbation_gene_names, perturbation_pvalues))
 
         # Create p-values in the same order as predicted scores (original gene order)
-        aligned_pvals = []
-        aligned_pred_scores = []
+        aligned_pvalues = []
+        aligned_predicted_scores = []
 
         for i, gene in enumerate(gene_order):
-            if gene in gene_to_pval:
-                aligned_pvals.append(gene_to_pval[gene])
-                aligned_pred_scores.append(pred_scores[i])
+            if gene in gene_to_pvalue_map:
+                aligned_pvalues.append(gene_to_pvalue_map[gene])
+                aligned_predicted_scores.append(predicted_effect_scores[i])
             else:
                 # If gene not in statistical test results, assign p-value of 1.0 (not significant)
-                aligned_pvals.append(1.0)
-                aligned_pred_scores.append(pred_scores[i])
+                aligned_pvalues.append(1.0)
+                aligned_predicted_scores.append(predicted_effect_scores[i])
 
-        aligned_pvals = np.array(aligned_pvals)
-        aligned_pred_scores = np.array(aligned_pred_scores)
+        aligned_pvalues = np.array(aligned_pvalues)
+        aligned_predicted_scores = np.array(aligned_predicted_scores)
 
-        # Create binary labels
-        true_labels = (aligned_pvals < 0.05).astype(int)
+        # Create binary labels based on statistical significance threshold (p < 0.05)
+        # Genes with p-value < 0.05 are considered true DE genes
+        ground_truth_binary_labels = (aligned_pvalues < 0.05).astype(int)
 
-        # Skip if all labels are the same
-        if len(np.unique(true_labels)) < 2:
+        # Skip if all labels are the same (no variation for ROC/PR calculation)
+        if len(np.unique(ground_truth_binary_labels)) < 2:
             continue
 
-        # Compute ROC curve
-        fpr, tpr, _ = roc_curve(true_labels, aligned_pred_scores)
-        roc_auc = auc(fpr, tpr)
-        roc_curves.append((fpr, tpr))
+        # Compute ROC curve (Receiver Operating Characteristic)
+        false_positive_rate, true_positive_rate, _ = roc_curve(ground_truth_binary_labels, aligned_predicted_scores)
+        roc_auc = auc(false_positive_rate, true_positive_rate)
+        roc_curves.append((false_positive_rate, true_positive_rate))
         roc_aucs.append(roc_auc)
 
-        # Compute PR curve
-        precision, recall, _ = precision_recall_curve(true_labels, aligned_pred_scores)
+        # Compute PR curve (Precision-Recall)
+        precision, recall, _ = precision_recall_curve(ground_truth_binary_labels, aligned_predicted_scores)
         pr_auc = auc(recall, precision)
         pr_curves.append((precision, recall))
         pr_aucs.append(pr_auc)

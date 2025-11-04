@@ -197,14 +197,58 @@ def get_latest_checkpoint(cfg):
     return run_name, chk
 
 
-def compute_gene_overlap_cross_pert(DE_pred, DE_true, control_pert="non-targeting", k=50):
-    all_overlaps = {}
-    for c_gene in DE_pred.index:
-        if c_gene == control_pert:
+def compute_gene_overlap_cross_pert(
+    predicted_de_genes, ground_truth_de_genes, control_pert="non-targeting", top_k_genes_count=50
+):
+    """
+    Compute the overlap between predicted and ground truth differentially expressed (DE) genes.
+    
+    This function calculates the Jaccard-like overlap coefficient for each perturbation by comparing
+    the top-k predicted DE genes with the top-k ground truth DE genes identified via statistical tests.
+    
+    Parameters
+    ----------
+    predicted_de_genes : pd.DataFrame
+        DataFrame where each row represents a perturbation and contains the top-k predicted DE genes.
+        Index should be perturbation names.
+    ground_truth_de_genes : pd.DataFrame
+        DataFrame where each row represents a perturbation and contains the top-k ground truth DE genes
+        (typically identified via statistical tests like t-test or Wilcoxon rank-sum).
+        Index should be perturbation names.
+    control_pert : str, optional
+        Name of the control/reference perturbation to exclude from analysis (default: "non-targeting").
+    top_k_genes_count : int, optional
+        Number of top genes used for comparison (default: 50).
+        This is used as the denominator to normalize overlap scores.
+    
+    Returns
+    -------
+    dict
+        Dictionary mapping perturbation names to their overlap scores (range: 0.0 to 1.0).
+        An overlap score of 1.0 means perfect agreement between predicted and ground truth DE genes.
+    
+    Notes
+    -----
+    The overlap score for each perturbation is computed as:
+        overlap = |predicted_genes ∩ ground_truth_genes| / top_k_genes_count
+    
+    This metric evaluates how well the model identifies the same DE genes as statistical methods
+    used in CELL-EVAL framework for differential expression analysis.
+    """
+    perturbation_overlaps = {}
+    for perturbation_name in predicted_de_genes.index:
+        if perturbation_name == control_pert:
             continue
-        all_overlaps[c_gene] = len(set(DE_true.loc[c_gene].values).intersection(set(DE_pred.loc[c_gene].values))) / k
+        
+        # Calculate intersection between predicted and ground truth DE genes
+        predicted_gene_set = set(predicted_de_genes.loc[perturbation_name].values)
+        ground_truth_gene_set = set(ground_truth_de_genes.loc[perturbation_name].values)
+        overlap_count = len(predicted_gene_set.intersection(ground_truth_gene_set))
+        
+        # Normalize by the number of top genes to get overlap coefficient
+        perturbation_overlaps[perturbation_name] = overlap_count / top_k_genes_count
 
-    return all_overlaps
+    return perturbation_overlaps
 
 
 def parse_chk_info(chk):
