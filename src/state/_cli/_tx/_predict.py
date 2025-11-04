@@ -396,11 +396,14 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info(f"Saved adata_real to {adata_real_path}")
 
     if not args.predict_only:
-        # 6. Compute metrics using cell-eval
+        # 6. Compute evaluation metrics using CELL-EVAL framework
+        # CELL-EVAL (https://github.com/ArcInstitute/cell-eval) provides standardized metrics
+        # for evaluating perturbation prediction models
         logger.info("Computing metrics using cell-eval...")
 
         control_pert = data_module.get_control_pert()
 
+        # Split data by cell type for cell-type-specific evaluation
         ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
         ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
 
@@ -408,19 +411,30 @@ def run_tx_predict(args: ap.ArgumentParser):
             f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
         )
 
-        pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
-        for ct in ct_split_real.keys():
-            real_ct = ct_split_real[ct]
-            pred_ct = ct_split_pred[ct]
+        # Configure PDEX (Perturbation Differential Expression) metric parameters
+        # These parameters control how DE genes are identified in CELL-EVAL:
+        #   - exp_post_agg: Whether to aggregate expression before computing differential expression
+        #   - is_log1p: Whether the data is log1p-transformed (affects how fold changes are computed)
+        pdex_metric_params = dict(exp_post_agg=True, is_log1p=True)
+        
+        for cell_type in ct_split_real.keys():
+            real_celltype_data = ct_split_real[cell_type]
+            pred_celltype_data = ct_split_pred[cell_type]
 
+            # Create CELL-EVAL MetricsEvaluator for this cell type
+            # The evaluator computes multiple metrics including:
+            #   - Pearson correlation of mean expression
+            #   - PDEX (differential expression overlap)
+            #   - R² scores
+            #   - Discrimination scores (if embeddings available)
             evaluator = MetricsEvaluator(
-                adata_pred=pred_ct,
-                adata_real=real_ct,
+                adata_pred=pred_celltype_data,
+                adata_real=real_celltype_data,
                 control_pert=control_pert,
                 pert_col=data_module.pert_col,
                 outdir=results_dir,
-                prefix=ct,
-                pdex_kwargs=pdex_kwargs,
+                prefix=cell_type,
+                pdex_kwargs=pdex_metric_params,
                 batch_size=2048,
             )
 
